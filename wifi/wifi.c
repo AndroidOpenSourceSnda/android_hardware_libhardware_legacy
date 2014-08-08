@@ -50,6 +50,11 @@
 static struct wpa_ctrl *ctrl_conn[MAX_CONNS];
 static struct wpa_ctrl *monitor_conn[MAX_CONNS];
 
+#ifdef CSPSA
+#include "cspsa.h"
+#define D_CSPSA_DEFAULT_NAME "CSPSA0"
+#endif
+
 /* socket pair used to exit from a blocking read */
 static int exit_sockets[MAX_CONNS][2];
 
@@ -82,12 +87,16 @@ static char primary_iface[PROPERTY_VALUE_MAX];
 #ifndef WIFI_DRIVER_FW_PATH_P2P
 #define WIFI_DRIVER_FW_PATH_P2P		NULL
 #endif
+#ifdef CSPSA
+#define WLAN_MAC_ADDR_SIZE              6
+#define CSPSA_WLAN_MAC_ADDR_KEY         0x00010000
+#define MAC_FMT                         "0x%02x,0x%02x,0x%02x,0x%02x,0x%02x,0x%02x"
+#define WIFI_DRIVER_LOAD_DELAY          1
+#endif
 
 #ifndef WIFI_DRIVER_FW_PATH_PARAM
 #define WIFI_DRIVER_FW_PATH_PARAM	"/sys/module/wlan/parameters/fwpath"
 #endif
-
-#define WIFI_DRIVER_LOADER_DELAY	1000000
 
 static const char IFACE_DIR[]           = "/data/system/wpa_supplicant";
 #ifdef WIFI_DRIVER_MODULE_PATH
@@ -107,6 +116,90 @@ static const char SUPP_CONFIG_FILE[]    = "/data/misc/wifi/wpa_supplicant.conf";
 static const char P2P_CONFIG_FILE[]     = "/data/misc/wifi/p2p_supplicant.conf";
 static const char CONTROL_IFACE_PATH[]  = "/data/misc/wifi/sockets";
 static const char MODULE_FILE[]         = "/proc/modules";
+
+#ifdef CSPSA
+static const char WLAN_MAC_ADDRESS_PARAM_NAME[]                = "macaddr";
+static const char WLAN_INVALID_MAC_ADDRESS[]                   = {0x00};
+
+static int wifi_fetch_mac(char* wifi_driver_param)
+{
+    int found = 0;
+    int ret = -1;
+
+    CSPSA_Result_t result;
+    CSPSA_Handle_t handle;
+    CSPSA_Size_t size;
+    CSPSA_Key_t key = CSPSA_WLAN_MAC_ADDR_KEY;
+    CSPSA_Data_t *cspsa_data = NULL;
+
+    result = CSPSA_Open(D_CSPSA_DEFAULT_NAME, &handle);
+    if (result != T_CSPSA_RESULT_OK) {
+        ALOGE("Can't open CSPSA area (result 0x%X) ", result);
+        goto cspsa_finished;
+    }
+
+    result = CSPSA_GetSizeOfValue(handle, key, &size);
+    if (result != T_CSPSA_RESULT_OK) {
+        ALOGE("Can't get size of key (h %p key 0x%x result 0x%X).",
+          handle, key, result);
+        goto cspsa_finished;
+    }
+
+    if (size != WLAN_MAC_ADDR_SIZE) {
+        ALOGE("Read wrong amount of bytes: %d", size);
+        goto cspsa_finished;
+    }
+
+    cspsa_data = (CSPSA_Data_t *) malloc(size);
+    if (!cspsa_data) {
+        ALOGE("Can't malloc %d bytes.", size);
+        goto cspsa_finished;
+    }
+
+    result = CSPSA_ReadValue(handle, key, size, cspsa_data);
+    if (result != T_CSPSA_RESULT_OK) {
+        ALOGE("Can't read from CSPSA (h %p  key 0x%x size %d res 0x%X).",
+            handle, key, size, result);
+        goto cspsa_finished;
+    }
+
+    /* Don't use CSPSA MAC address if it ends with :00:00:00.*/
+    if ((0 == cspsa_data[3]) && (0 == cspsa_data[4]) && (0 == cspsa_data[5])) {
+        ALOGI("Default MAC address read from CSPSA. Using random.");
+        goto cspsa_finished;
+    }
+
+    found = 1;
+    ret = 0; //success
+    memcpy(wifi_driver_param, cspsa_data, WLAN_MAC_ADDR_SIZE);
+    ALOGI("MAC address from CSPSA [0x%02x:0x%02x:0x%02x:0x%02x:0x%02x:0x%02x]",
+         cspsa_data[0], cspsa_data[1], cspsa_data[2],
+         cspsa_data[3], cspsa_data[4], cspsa_data[5]);
+
+cspsa_finished:
+    if (cspsa_data)
+        free(cspsa_data);
+    result = CSPSA_Close(&handle);
+    if (result != T_CSPSA_RESULT_OK)
+        ALOGE("Can't close CSPSA area (result %x) ", result);
+    if (found == 0) {
+      memcpy(wifi_driver_param, WLAN_INVALID_MAC_ADDRESS,
+              sizeof(WLAN_INVALID_MAC_ADDRESS));
+    }
+    return ret;
+}
+
+static void wifi_format_mac_param(char* mac)
+{
+    char mac_address[100];
+    sprintf(mac_address, MAC_FMT,
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    mac[0] = ' '; //one space to separate insmod parameters
+    strcpy(&mac[1], WLAN_MAC_ADDRESS_PARAM_NAME);
+    strcat(mac, "=");
+    strcat(mac, mac_address);
+}
+#endif
 
 static const char SUPP_ENTROPY_FILE[]   = WIFI_ENTROPY_FILE;
 static unsigned char dummy_key[21] = { 0x02, 0x11, 0xbe, 0x33, 0x43, 0x35,
@@ -139,7 +232,21 @@ static int insmod(const char *filename, const char *args)
     if (!module)
         return -1;
 
+#ifndef CSPSA
     ret = init_module(module, size, args);
+#else
+    char driver_module_arg[255];
+    char mac_address_param[255];
+
+    if (0 == wifi_fetch_mac(mac_address_param)) {
+        wifi_format_mac_param(mac_address_param);
+    }
+    strcat(driver_module_arg, mac_address_param);
+    ALOGI("***wlan.ko (%s)", driver_module_arg);
+
+    ret = init_module(module, size, driver_module_arg);
+#endif
+
 
     free(module);
 
@@ -238,7 +345,9 @@ int wifi_load_driver()
         return -1;
 
     if (strcmp(FIRMWARE_LOADER,"") == 0) {
-        /* usleep(WIFI_DRIVER_LOADER_DELAY); */
+#ifdef WIFI_DRIVER_LOADER_DELAY
+        usleep(WIFI_DRIVER_LOADER_DELAY);
+#endif
         property_set(DRIVER_PROP_NAME, "ok");
     }
     else {
